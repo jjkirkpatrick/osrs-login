@@ -10,6 +10,7 @@ import (
 // without a browser, and to remember which character was last used.
 type Creds struct {
 	RefreshToken string `json:"refresh_token"`
+	SessionID    string `json:"session_id"`
 	AccountID    string `json:"account_id"`
 }
 

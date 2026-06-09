@@ -2,7 +2,7 @@
 
 A minimal, Bolt-free launcher for Old School RuneScape on Linux. It replicates
 the Jagex-account OAuth2 flow that the (now-archived) [Bolt](https://github.com/Adamcake/Bolt)
-launcher uses, but does the one interactive step in the user's **real browser**
+launcher uses, but does the interactive steps in the user's **real browser**
 instead of an embedded CEF browser — sidestepping the sandbox/Wayland/NVIDIA
 render bugs that make Bolt's login fail on some setups.
 
@@ -28,7 +28,7 @@ Constants are lifted verbatim from Bolt's source (`src/browser/app.cxx`,
 | Consent client_id | `1fddee4e-b100-4f4e-b2b0-097f9088f9d2` (redirect `http://localhost`) |
 | Game session API | `https://auth.jagex.com/game-session/v1` (`/sessions`, `/accounts`) |
 
-**First login**
+**First login (cold)**
 
 1. Generate PKCE (S256) + state; open the browser to `/oauth2/auth`
    (`response_type=code`, scope `openid offline gamesso.token.create user.profile.read`).
@@ -36,53 +36,70 @@ Constants are lifted verbatim from Bolt's source (`src/browser/app.cxx`,
    User **pastes that URL** into the terminal; we extract `code`.
 3. `POST /oauth2/token` (`grant_type=authorization_code`, `code_verifier`) →
    `access_token`, `id_token`, `refresh_token`.
-4. **Consent (server-side, no browser):** `GET /oauth2/auth` with
-   `id_token_hint`, the consent client_id, `response_type=id_token code`,
-   `redirect_uri=http://localhost`, *without following redirects*. Read the
-   `Location` header and pull the game-scoped `id_token` from its query/fragment.
+4. **Consent (browser):** open `/oauth2/auth` (consent client_id,
+   `response_type=id_token code`, `redirect_uri=http://localhost`) in the
+   browser; it redirects to `http://localhost#id_token=…` (a failed page load).
+   User **pastes that URL**; we pull the game-scoped `id_token` from the fragment.
 5. `POST /game-session/v1/sessions` `{"idToken": …}` → `sessionId`.
 6. `GET /game-session/v1/accounts` (`Authorization: Bearer <sessionId>`) →
    characters.
 7. Pick a character; set `JX_SESSION_ID`, `JX_CHARACTER_ID` (= `accountId`),
    `JX_DISPLAY_NAME`; `exec runelite`.
 
-**Subsequent launches:** load cached refresh token → `refresh` → steps 4–7. No
-browser, no paste. If the refresh fails, fall back to the browser login.
+**Subsequent launches:** reuse the cached `sessionId` — `listAccounts` it; if
+valid, jump straight to steps 6–7. No browser, no paste. Only when the session
+has expired do we fall back to the full login above.
 
-### The one reverse-engineered assumption
+### The consent step (confirmed live)
 
-Bolt runs the consent step (step 4) inside its browser, which carries the login
-session cookies. We do it server-side relying solely on `id_token_hint`. This is
-the standard OIDC mechanism and the expected behaviour, but it is the single part
-that must be confirmed against the live server on first run. If the consent
-endpoint refuses without a browser session, the fallback is to open the consent
-URL in the browser and paste the resulting `http://localhost#…` URL (the code
-already parses both query and fragment).
+Bolt runs the consent step inside its browser, which carries the login session
+cookies. We try three paths cheapest-first in `obtainSession`:
+
+- **(a)** `POST /sessions` with the login `id_token` directly — *fails* live
+  (the launcher-audience token isn't accepted by the game-session API).
+- **(b)** server-side consent (`GET /oauth2/auth` + `id_token_hint`, read the
+  `Location` header) — *fails* live with **HTTP 403**; Jagex requires the browser
+  login-session cookie, which a server-side call doesn't have.
+- **(c)** **browser consent** — open the consent URL in the user's browser (it
+  has the cookie), let it redirect to `http://localhost#id_token=…` (a
+  "can't connect" page is expected), and paste that URL back. This **works**.
+
+So a **cold login is two pastes** (the login redirect URL, then the
+`http://localhost#…` consent URL). Paths (a)/(b) are kept in case Jagex ever
+loosens them.
 
 ## Components (one Go package, no external deps)
 
 - `jagex.go` — constants, types, PKCE, URL building, token exchange/refresh,
   consent, session creation, account listing, response parsing.
 - `store.go` — load/save/clear `$XDG_DATA_HOME/osrs-login/creds.json`
-  (`{refresh_token, account_id}`, mode `0600`).
-- `main.go` — CLI parsing, orchestration, character selection, `exec` handoff.
+  (`{refresh_token, session_id, account_id}`, mode `0600`).
+- `main.go` — CLI parsing (`pick`/`login`/`logout` + `--client`/`--character`),
+  orchestration, character selection, `exec` handoff.
 - `jagex_test.go` — unit tests for the pure logic (PKCE, URL/redirect parsing,
-  JSON parsing). Live OAuth is validated by running it once.
+  JSON parsing). Live OAuth validated by running it end-to-end.
 
 ## Storage & trust
 
-The refresh token grants account access; stored in plaintext at mode `0600`,
-the same trust model Bolt uses. `osrs-login logout` removes it.
+The refresh token and session id grant account access; stored in plaintext at
+mode `0600`, the same trust model Bolt uses. `osrs-login logout` removes them.
+
+## Commands
+
+- `osrs-login` — reuse the saved session and launch the remembered character.
+- `osrs-login pick` — reuse the saved session but always show the character menu.
+- `osrs-login login` — force a fresh browser login.
+- `osrs-login logout` — forget the saved session.
+- `--client <cmd>` / `--character <name>` — override the client or skip the menu.
 
 ## Scope
 
 **v1:** OSRS + RuneLite, single Jagex account, character remembered after first
-choice. **Non-goals (easy to add later):** RS3, HDOS, the official client, a GUI,
-multi-account quick-switching.
+choice (re-choose with `pick`). **Non-goals (easy to add later):** RS3, HDOS, the
+official client, a GUI, multi-account quick-switching.
 
 ## Packaging
 
 A flake exposing `packages.default` (`buildGoModule`, `vendorHash = null`) and a
-`go` devShell. Consumed from the user's NixOS config either by adding this repo
-as a flake input, or building it locally. A `.desktop` entry can wrap
-`osrs-login` for the app launcher.
+`go` devShell. Consumed from the user's NixOS config by adding this repo as a
+flake input. A `.desktop` entry can wrap `osrs-login` for the app launcher.

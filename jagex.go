@@ -25,10 +25,14 @@ const (
 	consentRedirect  = "http://localhost"
 	loginScope       = "openid offline gamesso.token.create user.profile.read"
 	consentScope     = "openid offline"
+
+	// userAgent is sent on every request; Jagex's edge rejects the default Go
+	// user-agent with 403 on some endpoints.
+	userAgent = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 )
 
-// httpClient follows redirects normally; noRedirect lets us read the Location
-// header of the consent step instead of following it.
+// httpClient follows redirects; noRedirect lets us read the Location header of
+// the consent step instead of following it.
 var (
 	httpClient = &http.Client{Timeout: 30 * time.Second}
 	noRedirect = &http.Client{
@@ -38,6 +42,12 @@ var (
 		},
 	}
 )
+
+// send sets the shared User-Agent and performs the request.
+func send(client *http.Client, req *http.Request) (*http.Response, error) {
+	req.Header.Set("User-Agent", userAgent)
+	return client.Do(req)
+}
 
 // Tokens is an OAuth2 token set.
 type Tokens struct {
@@ -95,6 +105,23 @@ func loginURL(challenge, state string) string {
 	return authOrigin + "/oauth2/auth?" + q.Encode()
 }
 
+// consentURL builds the consent authorization URL. Opened in the browser it
+// carries the login session cookie and redirects to http://localhost with a
+// game-scoped id_token in the fragment.
+func consentURL(idToken string) string {
+	q := url.Values{
+		"id_token_hint": {idToken},
+		"nonce":         {randomString(16)},
+		"prompt":        {"consent"},
+		"redirect_uri":  {consentRedirect},
+		"response_type": {"id_token code"},
+		"state":         {randomString(16)},
+		"client_id":     {consentClientID},
+		"scope":         {consentScope},
+	}
+	return authOrigin + "/oauth2/auth?" + q.Encode()
+}
+
 // parseAuthCode extracts the `code` parameter from the URL the user is
 // redirected to after logging in (and pastes back).
 func parseAuthCode(redirectedURL string) (string, error) {
@@ -109,9 +136,23 @@ func parseAuthCode(redirectedURL string) (string, error) {
 	return code, nil
 }
 
+// tokenFromConsentRedirect extracts the game-scoped id_token from the
+// http://localhost URL the consent step redirects to.
+func tokenFromConsentRedirect(pasted string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(pasted))
+	if err != nil {
+		return "", fmt.Errorf("that doesn't look like a URL: %w", err)
+	}
+	t := mergeQueryFragment(u).Get("id_token")
+	if t == "" {
+		return "", errors.New("no `id_token` found in the pasted URL")
+	}
+	return t, nil
+}
+
 // mergeQueryFragment returns the union of a URL's query and fragment parameters.
-// The consent step (response_type "id_token code") returns its result in the
-// fragment, while the login step returns `code` in the query.
+// The consent step returns its result in the fragment; the login step returns
+// `code` in the query.
 func mergeQueryFragment(u *url.URL) url.Values {
 	vals := u.Query()
 	if u.Fragment != "" {
@@ -150,7 +191,7 @@ func postToken(form url.Values) (Tokens, error) {
 	req, _ := http.NewRequest(http.MethodPost, authOrigin+"/oauth2/token", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	resp, err := httpClient.Do(req)
+	resp, err := send(httpClient, req)
 	if err != nil {
 		return Tokens{}, err
 	}
@@ -159,11 +200,7 @@ func postToken(form url.Values) (Tokens, error) {
 	if resp.StatusCode != http.StatusOK {
 		return Tokens{}, fmt.Errorf("token endpoint returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	tokens, err := parseTokenResponse(body)
-	if err != nil {
-		return Tokens{}, err
-	}
-	return tokens, nil
+	return parseTokenResponse(body)
 }
 
 // parseTokenResponse decodes the JSON body of an /oauth2/token response.
@@ -178,47 +215,39 @@ func parseTokenResponse(body []byte) (Tokens, error) {
 	return Tokens{AccessToken: tr.AccessToken, IDToken: tr.IDToken, RefreshToken: tr.RefreshToken}, nil
 }
 
-// consent performs the non-interactive consent step, exchanging the login
-// id_token for a game-scoped id_token. It is done server-side by reading the
-// redirect Location header, so no browser is involved.
-func consent(idToken string) (string, error) {
-	q := url.Values{
-		"id_token_hint": {idToken},
-		"nonce":         {randomString(16)},
-		"prompt":        {"consent"},
-		"redirect_uri":  {consentRedirect},
-		"response_type": {"id_token code"},
-		"state":         {randomString(16)},
-		"client_id":     {consentClientID},
-		"scope":         {consentScope},
-	}
-	resp, err := noRedirect.Get(authOrigin + "/oauth2/auth?" + q.Encode())
+// consentExchange tries the consent step server-side, reading the redirect
+// Location header. This works only if Jagex accepts id_token_hint without a
+// browser session; if not, the caller falls back to an interactive browser
+// consent.
+func consentExchange(idToken string) (string, error) {
+	req, _ := http.NewRequest(http.MethodGet, consentURL(idToken), nil)
+	resp, err := send(noRedirect, req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	loc := resp.Header.Get("Location")
 	if loc == "" {
-		return "", fmt.Errorf("consent step did not redirect (status %d); try `osrs-login login` to re-authenticate", resp.StatusCode)
+		return "", fmt.Errorf("consent returned status %d without a redirect", resp.StatusCode)
 	}
 	lu, err := url.Parse(loc)
 	if err != nil {
 		return "", fmt.Errorf("parsing consent redirect %q: %w", loc, err)
 	}
-	gameToken := mergeQueryFragment(lu).Get("id_token")
-	if gameToken == "" {
+	t := mergeQueryFragment(lu).Get("id_token")
+	if t == "" {
 		return "", fmt.Errorf("no id_token in consent redirect: %s", loc)
 	}
-	return gameToken, nil
+	return t, nil
 }
 
-// createSession exchanges a game-scoped id_token for a game session id.
-func createSession(gameIDToken string) (string, error) {
-	body, _ := json.Marshal(map[string]string{"idToken": gameIDToken})
+// createSession exchanges an id_token for a game session id.
+func createSession(idToken string) (string, error) {
+	body, _ := json.Marshal(map[string]string{"idToken": idToken})
 	req, _ := http.NewRequest(http.MethodPost, gameAuthAPI+"/sessions", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	resp, err := httpClient.Do(req)
+	resp, err := send(httpClient, req)
 	if err != nil {
 		return "", err
 	}
@@ -244,12 +273,14 @@ func parseSessionResponse(body []byte) (string, error) {
 	return sr.SessionID, nil
 }
 
-// listAccounts returns the playable characters for a session.
+// listAccounts returns the playable characters for a session. A non-200 (e.g.
+// 401 for an expired session) is returned as an error so callers can fall back
+// to a fresh login.
 func listAccounts(sessionID string) ([]Account, error) {
 	req, _ := http.NewRequest(http.MethodGet, gameAuthAPI+"/accounts", nil)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+sessionID)
-	resp, err := httpClient.Do(req)
+	resp, err := send(httpClient, req)
 	if err != nil {
 		return nil, err
 	}

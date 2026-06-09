@@ -14,15 +14,22 @@ the Jagex endpoints come from.
 
 ```
 osrs-login            # log in (reusing a saved session if possible) and launch RuneLite
+osrs-login pick       # show the character menu, then launch the chosen character
 osrs-login login      # force a fresh browser login
 osrs-login logout     # forget the saved session
-osrs-login --character Zezima      # launch a specific character
+osrs-login --character Zezima      # launch a specific character (skips the menu)
 osrs-login --client hdos           # launch a different client binary on PATH
 ```
 
-First run: a browser tab opens for the Jagex login. After you log in you'll land
-on a `runescape.com` page — copy its full address from the URL bar and paste it
-back into the terminal. That's the only manual step, and only on first login.
+Plain `osrs-login` remembers the last character you picked and launches it
+straight away. Use `osrs-login pick` whenever you want to choose a different one
+(it reuses the saved session, so no browser).
+
+A cold login (first run, or after the session expires) takes **two pastes**: open
+the printed Jagex login URL, log in, and paste the `runescape.com` URL you land
+on; then it opens a consent URL whose `http://localhost#…` result (a
+"can't connect" page is normal) you paste once more. After that the game session
+is cached and launches need no browser at all.
 
 `runelite` (or whatever `--client` you pass) must be on your `PATH`.
 
