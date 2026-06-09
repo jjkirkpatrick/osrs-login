@@ -1,0 +1,6 @@
+# build artifacts
+/result
+/osrs-login
+
+# go
+/vendor/
