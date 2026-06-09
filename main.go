@@ -16,6 +16,8 @@ import (
 	"syscall"
 )
 
+const version = "0.1.0"
+
 const usage = `osrs-login — minimal Jagex-account launcher for Old School RuneScape
 
 Usage:
@@ -40,6 +42,9 @@ func main() {
 		switch args[i] {
 		case "-h", "--help":
 			fmt.Print(usage)
+			return
+		case "-v", "--version":
+			fmt.Println("osrs-login", version)
 			return
 		case "--client":
 			i++
@@ -142,7 +147,8 @@ func obtainSession(tokens Tokens) (string, error) {
 // login session cookie) and reads the game-scoped id_token from the
 // http://localhost URL the browser is redirected to.
 func browserConsent(idToken string) (string, error) {
-	u := consentURL(idToken)
+	state, nonce := randomString(16), randomString(16)
+	u := consentURL(idToken, state, nonce)
 	fmt.Println("\nOne more step — authorizing your game session.")
 	openBrowser(u)
 	fmt.Println("If your browser didn't open, paste this URL into it:")
@@ -151,7 +157,7 @@ func browserConsent(idToken string) (string, error) {
 	fmt.Println("connect — that is expected. Copy that http://localhost#... address from")
 	fmt.Print("the address bar and paste it here:\n> ")
 	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-	return tokenFromConsentRedirect(line)
+	return tokenFromConsentRedirect(line, state, nonce)
 }
 
 // finishLaunch selects a character, persists state, and execs the client.
@@ -183,7 +189,8 @@ func authenticate(forceLogin bool, savedRefresh string) (Tokens, error) {
 
 func interactiveLogin() (Tokens, error) {
 	verifier, challenge := pkce()
-	u := loginURL(challenge, randomString(16))
+	state := randomString(16)
+	u := loginURL(challenge, state)
 
 	fmt.Println("Opening your browser to log in to your Jagex account...")
 	openBrowser(u)
@@ -193,7 +200,7 @@ func interactiveLogin() (Tokens, error) {
 	fmt.Print("address from the browser and paste it here, then press Enter:\n> ")
 
 	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-	code, err := parseAuthCode(line)
+	code, err := parseAuthCode(line, state)
 	if err != nil {
 		return Tokens{}, err
 	}

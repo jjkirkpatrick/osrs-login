@@ -3,7 +3,12 @@
 A tiny, **Bolt-free** launcher for **Old School RuneScape** on Linux. It does the
 Jagex-account login in your **normal web browser** (no embedded CEF browser), then
 launches **RuneLite** with the credentials it needs. After the first login it
-caches a refresh token, so later launches start the game with no browser at all.
+caches the game session, so later launches start the game with no browser at all.
+
+> ⚠️ **Unofficial & unsupported.** Not affiliated with, authored by, or endorsed
+> by Jagex. RuneScape and Old School RuneScape are trademarks of Jagex Ltd. This
+> is a reverse-engineered interop client — it may break when Jagex changes their
+> auth flow, and you use it **at your own risk**.
 
 Built because Bolt's embedded login browser crashes / shows a blank screen on
 some setups (notably NixOS + NVIDIA + Wayland), and the official Jagex Launcher
@@ -45,9 +50,9 @@ nix build .               # produces ./result/bin/osrs-login
 With the Go toolchain:
 
 ```sh
-go test ./...
-go build -o osrs-login .
-./osrs-login
+go install github.com/jjkirkpatrick/osrs-login@latest
+# or, in a clone:
+go test ./... && go build -o osrs-login . && ./osrs-login
 ```
 
 ## Install on NixOS
@@ -56,7 +61,7 @@ Add it as a flake input and put the package in your environment, e.g.:
 
 ```nix
 # flake.nix inputs
-osrs-login.url = "git+file:///home/josh/repos/osrs-login";   # or a git remote
+osrs-login.url = "github:jjkirkpatrick/osrs-login";
 
 # somewhere in your packages list
 inputs.osrs-login.packages.${pkgs.system}.default
@@ -74,6 +79,15 @@ with `0600` permissions — the same plaintext model Bolt uses. Run
 
 ## Status
 
-v1: OSRS + RuneLite, single account. Unofficial and reverse-engineered from
-Bolt's (open) source — if Jagex changes their auth flow it may need updating. Not
-affiliated with or endorsed by Jagex.
+v1: OSRS + RuneLite, single account. The login is validated end-to-end against
+the live Jagex API.
+
+## Acknowledgements & licensing
+
+This is an independent reimplementation. The Jagex OAuth endpoints, client IDs,
+and request parameters were determined by inspecting the open-source
+[Bolt](https://github.com/Adamcake/Bolt) launcher (AGPL-3.0) — these are factual
+interoperability constants, and **this project contains no Bolt source code**.
+Thanks to the Bolt authors for documenting the flow.
+
+osrs-login itself is licensed [MIT](./LICENSE).

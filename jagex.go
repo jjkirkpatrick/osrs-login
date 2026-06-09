@@ -107,29 +107,34 @@ func loginURL(challenge, state string) string {
 
 // consentURL builds the consent authorization URL. Opened in the browser it
 // carries the login session cookie and redirects to http://localhost with a
-// game-scoped id_token in the fragment.
-func consentURL(idToken string) string {
+// game-scoped id_token in the fragment. The caller supplies state and nonce so
+// it can verify them on the way back.
+func consentURL(idToken, state, nonce string) string {
 	q := url.Values{
 		"id_token_hint": {idToken},
-		"nonce":         {randomString(16)},
+		"nonce":         {nonce},
 		"prompt":        {"consent"},
 		"redirect_uri":  {consentRedirect},
 		"response_type": {"id_token code"},
-		"state":         {randomString(16)},
+		"state":         {state},
 		"client_id":     {consentClientID},
 		"scope":         {consentScope},
 	}
 	return authOrigin + "/oauth2/auth?" + q.Encode()
 }
 
-// parseAuthCode extracts the `code` parameter from the URL the user is
-// redirected to after logging in (and pastes back).
-func parseAuthCode(redirectedURL string) (string, error) {
+// parseAuthCode extracts the `code` from the URL the user is redirected to after
+// logging in, verifying the `state` round-trips to guard against CSRF.
+func parseAuthCode(redirectedURL, expectedState string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(redirectedURL))
 	if err != nil {
 		return "", fmt.Errorf("that doesn't look like a URL: %w", err)
 	}
-	code := mergeQueryFragment(u).Get("code")
+	vals := mergeQueryFragment(u)
+	if got := vals.Get("state"); got != expectedState {
+		return "", fmt.Errorf("state mismatch (possible CSRF) — got %q, expected %q", got, expectedState)
+	}
+	code := vals.Get("code")
 	if code == "" {
 		return "", errors.New("no `code` found in the pasted URL — did you copy the full address after logging in?")
 	}
@@ -137,17 +142,54 @@ func parseAuthCode(redirectedURL string) (string, error) {
 }
 
 // tokenFromConsentRedirect extracts the game-scoped id_token from the
-// http://localhost URL the consent step redirects to.
-func tokenFromConsentRedirect(pasted string) (string, error) {
+// http://localhost URL the consent step redirects to, verifying both the `state`
+// parameter and the id_token's `nonce` round-trip.
+func tokenFromConsentRedirect(pasted, expectedState, expectedNonce string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(pasted))
 	if err != nil {
 		return "", fmt.Errorf("that doesn't look like a URL: %w", err)
 	}
-	t := mergeQueryFragment(u).Get("id_token")
+	vals := mergeQueryFragment(u)
+	if got := vals.Get("state"); got != expectedState {
+		return "", fmt.Errorf("state mismatch (possible CSRF) — got %q, expected %q", got, expectedState)
+	}
+	t := vals.Get("id_token")
 	if t == "" {
 		return "", errors.New("no `id_token` found in the pasted URL")
 	}
+	if err := validateNonce(t, expectedNonce); err != nil {
+		return "", err
+	}
 	return t, nil
+}
+
+// validateNonce checks that a JWT's `nonce` claim matches what we sent.
+func validateNonce(idToken, expectedNonce string) error {
+	claims, err := jwtClaims(idToken)
+	if err != nil {
+		return err
+	}
+	if got, _ := claims["nonce"].(string); got != expectedNonce {
+		return errors.New("id_token nonce mismatch")
+	}
+	return nil
+}
+
+// jwtClaims decodes (without verifying the signature) the payload of a JWT.
+func jwtClaims(token string) (map[string]any, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("malformed JWT: %d sections, expected 3", len(parts))
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("decoding JWT payload: %w", err)
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil, fmt.Errorf("parsing JWT payload: %w", err)
+	}
+	return claims, nil
 }
 
 // mergeQueryFragment returns the union of a URL's query and fragment parameters.
@@ -220,7 +262,8 @@ func parseTokenResponse(body []byte) (Tokens, error) {
 // browser session; if not, the caller falls back to an interactive browser
 // consent.
 func consentExchange(idToken string) (string, error) {
-	req, _ := http.NewRequest(http.MethodGet, consentURL(idToken), nil)
+	state, nonce := randomString(16), randomString(16)
+	req, _ := http.NewRequest(http.MethodGet, consentURL(idToken, state, nonce), nil)
 	resp, err := send(noRedirect, req)
 	if err != nil {
 		return "", err
@@ -230,15 +273,7 @@ func consentExchange(idToken string) (string, error) {
 	if loc == "" {
 		return "", fmt.Errorf("consent returned status %d without a redirect", resp.StatusCode)
 	}
-	lu, err := url.Parse(loc)
-	if err != nil {
-		return "", fmt.Errorf("parsing consent redirect %q: %w", loc, err)
-	}
-	t := mergeQueryFragment(lu).Get("id_token")
-	if t == "" {
-		return "", fmt.Errorf("no id_token in consent redirect: %s", loc)
-	}
-	return t, nil
+	return tokenFromConsentRedirect(loc, state, nonce)
 }
 
 // createSession exchanges an id_token for a game session id.
