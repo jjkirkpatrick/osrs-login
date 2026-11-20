@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=osrs-login jagex: link handler
+Comment=Hands the Jagex login back to a waiting osrs-login
+Exec=osrs-login %u
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/jagex;

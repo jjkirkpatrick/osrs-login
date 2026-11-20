@@ -32,8 +32,12 @@ Constants are lifted verbatim from Bolt's source (`src/browser/app.cxx`,
 
 1. Generate PKCE (S256) + state; open the browser to `/oauth2/auth`
    (`response_type=code`, scope `openid offline gamesso.token.create user.profile.read`).
-2. User logs in → lands on `secure.runescape.com/...launcher-redirect?code=…`.
-   User **pastes that URL** into the terminal; we extract `code`.
+2. User logs in → lands on `secure.runescape.com/...launcher-redirect?code=…`,
+   which opens `jagex:code=…,state=…,intent=social_auth`. If
+   `osrs-login-handler.desktop` owns `x-scheme-handler/jagex`, a second
+   `osrs-login jagex:…` process forwards that URI over a unix socket
+   (`$XDG_RUNTIME_DIR/osrs-login.sock`) to the waiting prompt. Otherwise the user
+   **pastes the URL**. Either way we check `state` and extract `code`.
 3. `POST /oauth2/token` (`grant_type=authorization_code`, `code_verifier`) →
    `access_token`, `id_token`, `refresh_token`.
 4. **Consent (browser):** open `/oauth2/auth` (consent client_id,
@@ -66,7 +70,7 @@ cookies. We try three paths cheapest-first in `obtainSession`:
 
 So a **cold login is two pastes** (the login redirect URL, then the
 `http://localhost#…` consent URL). Paths (a)/(b) are kept in case Jagex ever
-loosens them.
+loosens them. With the `jagex:` handler installed, the first paste goes away.
 
 ## Components (one Go package, no external deps)
 
@@ -91,6 +95,8 @@ mode `0600`, the same trust model Bolt uses. `osrs-login logout` removes them.
 - `osrs-login login` — force a fresh browser login.
 - `osrs-login logout` — forget the saved session.
 - `--client <cmd>` / `--character <name>` — override the client or skip the menu.
+- `--picker <cmd>` — show the character menu with a dmenu-style command.
+- `--terminal <cmd>` — when a login prompt has no tty, re-exec inside this.
 
 ## Scope
 
@@ -102,4 +108,6 @@ official client, a GUI, multi-account quick-switching.
 
 A flake exposing `packages.default` (`buildGoModule`, `vendorHash = null`) and a
 `go` devShell. Consumed from the user's NixOS config by adding this repo as a
-flake input. A `.desktop` entry can wrap `osrs-login` for the app launcher.
+flake input. `postInstall` copies `dist/*.desktop` (the `jagex:` handler) into
+`share/applications`. No launcher entry is shipped, because it depends on the
+user's picker and terminal (`--picker`, `--terminal`; see the README).

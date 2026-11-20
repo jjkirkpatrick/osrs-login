@@ -20,6 +20,10 @@
           src = ./.;
           vendorHash = null; # no external dependencies
 
+          postInstall = ''
+            install -Dm644 -t $out/share/applications dist/*.desktop
+          '';
+
           meta = {
             description = "Minimal Bolt-free Jagex-account launcher for OSRS (browser login + RuneLite handoff)";
             mainProgram = "osrs-login";

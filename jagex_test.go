@@ -4,7 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -110,6 +114,16 @@ func TestChooseAccount(t *testing.T) {
 	if got, err := chooseAccount(accs, "", false, &Creds{AccountID: "a2"}); err != nil || got.AccountID != "a2" {
 		t.Fatalf("remembered: got %+v, err %v", got, err)
 	}
+	// --picker: names go to the command's stdin, its output selects ("tail -n 1" picks the last)
+	pickerCmd = "tail -n 1"
+	defer func() { pickerCmd = "" }()
+	if got, err := chooseAccount(accs, "", true, &Creds{}); err != nil || got.AccountID != "a2" {
+		t.Fatalf("picker: got %+v, err %v", got, err)
+	}
+	pickerCmd = "false" // cancelled picker
+	if _, err := chooseAccount(accs, "", true, &Creds{}); err == nil {
+		t.Fatal("expected an error when the picker is cancelled")
+	}
 }
 
 func TestMergeQueryFragment(t *testing.T) {
@@ -159,5 +173,52 @@ func TestAccountUnmarshal(t *testing.T) {
 	}
 	if len(accs) != 1 || accs[0].DisplayName != "Zezima" || accs[0].AccountID != "id1" {
 		t.Fatalf("unexpected accounts: %+v", accs)
+	}
+}
+
+func TestParseAuthCodeJagexScheme(t *testing.T) {
+	got, err := parseAuthCode("jagex:code=abc123,state=xyz,intent=social_auth\n", "xyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "abc123" {
+		t.Fatalf("code = %q, want abc123", got)
+	}
+	if _, err := parseAuthCode("jagex:code=abc123,state=evil,intent=social_auth", "xyz"); err == nil {
+		t.Fatal("expected an error on state mismatch")
+	}
+}
+
+func TestRejected(t *testing.T) {
+	for status, want := range map[int]bool{400: true, 401: true, 403: true, 429: false, 500: false, 503: false} {
+		err := fmt.Errorf("wrapped: %w", &httpError{"accounts", status, ""})
+		if got := rejected(err); got != want {
+			t.Errorf("rejected(%d) = %v, want %v", status, got, want)
+		}
+	}
+	if rejected(errors.New("dial tcp: no route to host")) {
+		t.Error("a network error must not count as rejected")
+	}
+}
+
+func TestSaveLoadCreds(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	want := Creds{RefreshToken: "r", SessionID: "s", AccountID: "a"}
+	if err := saveCreds(want); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCreds(want); err != nil { // overwrite path
+		t.Fatal(err)
+	}
+	got, err := loadCreds()
+	if err != nil || got != want {
+		t.Fatalf("loadCreds = %+v, %v; want %+v", got, err, want)
+	}
+	p, _ := credsPath()
+	if fi, _ := os.Stat(p); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("creds mode = %v, want 0600", fi.Mode().Perm())
+	}
+	if entries, _ := os.ReadDir(filepath.Dir(p)); len(entries) != 1 {
+		t.Fatalf("leftover temp files: %v", entries)
 	}
 }

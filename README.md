@@ -23,20 +23,57 @@ osrs-login pick       # show the character menu, then launch the chosen characte
 osrs-login login      # force a fresh browser login
 osrs-login logout     # forget the saved session
 osrs-login --character Zezima      # launch a specific character (skips the menu)
-osrs-login --client hdos           # launch a different client binary on PATH
+osrs-login --client hdos           # launch a different client on PATH
+osrs-login --client "flatpak run net.runelite.RuneLite"   # client command with arguments
+osrs-login pick --picker "fuzzel --dmenu"                # character menu in fuzzel, not the terminal
 ```
 
 Plain `osrs-login` remembers the last character you picked and launches it
 straight away. Use `osrs-login pick` whenever you want to choose a different one
 (it reuses the saved session, so no browser).
 
-A cold login (first run, or after the session expires) takes **two pastes**: open
-the printed Jagex login URL, log in, and paste the `runescape.com` URL you land
-on; then it opens a consent URL whose `http://localhost#…` result (a
-"can't connect" page is normal) you paste once more. After that the game session
-is cached and launches need no browser at all.
+A cold login (first run, or after the session expires) happens in your browser.
+After you log in, the Jagex page opens a `jagex:` link. If the link handler is
+installed (see below), the login goes straight back to osrs-login. If not, paste
+the `runescape.com` URL you land on into the terminal. Next it opens a consent URL.
+Paste its `http://localhost#…` result back (a "can't connect" page is normal).
+After that the game session is cached and launches need no browser at all.
 
-`runelite` (or whatever `--client` you pass) must be on your `PATH`.
+`runelite` (or the first word of whatever `--client` you pass) must be on your
+`PATH`.
+
+### App-launcher entry (no terminal)
+
+`--picker` shows the character menu with any dmenu-style program. `--terminal`
+opens a terminal only when a login actually needs typing (first run, or the
+session expired). A launcher entry like this one never opens a terminal on a
+normal launch:
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=Old School RuneScape
+Exec=osrs-login pick --picker "fuzzel --dmenu" --terminal "kitty -e"
+Terminal=false
+Categories=Game;
+```
+
+(rofi: `--picker "rofi -dmenu"`; foot: `--terminal foot`.) Both values are split
+on spaces, so arguments can't contain spaces.
+
+### The `jagex:` link handler
+
+`dist/osrs-login-handler.desktop` handles `jagex:` links, which removes the
+first login paste. The Nix package installs it. Elsewhere:
+
+```sh
+cp dist/osrs-login-handler.desktop ~/.local/share/applications/
+xdg-mime default osrs-login-handler.desktop x-scheme-handler/jagex
+update-desktop-database ~/.local/share/applications
+```
+
+If the official Jagex Launcher is installed it may already own `jagex:` links;
+the `xdg-mime` line above takes them back.
 
 ## Build / run
 

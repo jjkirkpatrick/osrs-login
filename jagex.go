@@ -49,6 +49,27 @@ func send(client *http.Client, req *http.Request) (*http.Response, error) {
 	return client.Do(req)
 }
 
+// httpError is a non-2xx response from a Jagex endpoint.
+type httpError struct {
+	endpoint string
+	status   int
+	body     string
+}
+
+func (e *httpError) Error() string {
+	return fmt.Sprintf("%s endpoint returned %d: %s", e.endpoint, e.status, e.body)
+}
+
+// rejected reports whether err is Jagex refusing our credentials (expired or
+// revoked), as opposed to a network or server fault where a fresh login won't help.
+func rejected(err error) bool {
+	var he *httpError
+	if !errors.As(err, &he) {
+		return false
+	}
+	return he.status == http.StatusBadRequest || he.status == http.StatusUnauthorized || he.status == http.StatusForbidden
+}
+
 // Tokens is an OAuth2 token set.
 type Tokens struct {
 	AccessToken  string
@@ -124,13 +145,25 @@ func consentURL(idToken, state, nonce string) string {
 }
 
 // parseAuthCode extracts the `code` from the URL the user is redirected to after
-// logging in, verifying the `state` round-trips to guard against CSRF.
+// logging in, verifying the `state` round-trips to guard against CSRF. It accepts
+// both the launcher-redirect https URL and the `jagex:code=…,state=…` URI that
+// page hands to the registered scheme handler.
 func parseAuthCode(redirectedURL, expectedState string) (string, error) {
-	u, err := url.Parse(strings.TrimSpace(redirectedURL))
-	if err != nil {
-		return "", fmt.Errorf("that doesn't look like a URL: %w", err)
+	s := strings.TrimSpace(redirectedURL)
+	var vals url.Values
+	if rest, ok := strings.CutPrefix(s, "jagex:"); ok {
+		v, err := url.ParseQuery(strings.ReplaceAll(rest, ",", "&"))
+		if err != nil {
+			return "", fmt.Errorf("malformed jagex: URI: %w", err)
+		}
+		vals = v
+	} else {
+		u, err := url.Parse(s)
+		if err != nil {
+			return "", fmt.Errorf("that doesn't look like a URL: %w", err)
+		}
+		vals = mergeQueryFragment(u)
 	}
-	vals := mergeQueryFragment(u)
 	if got := vals.Get("state"); got != expectedState {
 		return "", fmt.Errorf("state mismatch (possible CSRF) — got %q, expected %q", got, expectedState)
 	}
@@ -240,7 +273,7 @@ func postToken(form url.Values) (Tokens, error) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return Tokens{}, fmt.Errorf("token endpoint returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return Tokens{}, &httpError{"token", resp.StatusCode, strings.TrimSpace(string(body))}
 	}
 	return parseTokenResponse(body)
 }
@@ -289,7 +322,7 @@ func createSession(idToken string) (string, error) {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("sessions endpoint returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return "", &httpError{"sessions", resp.StatusCode, strings.TrimSpace(string(raw))}
 	}
 	return parseSessionResponse(raw)
 }
@@ -308,9 +341,8 @@ func parseSessionResponse(body []byte) (string, error) {
 	return sr.SessionID, nil
 }
 
-// listAccounts returns the playable characters for a session. A non-200 (e.g.
-// 401 for an expired session) is returned as an error so callers can fall back
-// to a fresh login.
+// listAccounts returns the playable characters for a session. A non-200 comes
+// back as an *httpError; see rejected() for telling an expired session apart.
 func listAccounts(sessionID string) ([]Account, error) {
 	req, _ := http.NewRequest(http.MethodGet, gameAuthAPI+"/accounts", nil)
 	req.Header.Set("Accept", "application/json")
@@ -322,7 +354,7 @@ func listAccounts(sessionID string) ([]Account, error) {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("accounts endpoint returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, &httpError{"accounts", resp.StatusCode, strings.TrimSpace(string(raw))}
 	}
 	var accs []Account
 	if err := json.Unmarshal(raw, &accs); err != nil {

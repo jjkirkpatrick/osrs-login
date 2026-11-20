@@ -9,11 +9,15 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"unsafe"
 )
 
 const version = "0.1.0"
@@ -28,12 +32,33 @@ Usage:
   osrs-login -h         Show this help
 
 Flags:
-  --client <cmd>        Client to launch (default: runelite)
+  --client <cmd>        Client command to launch, may include arguments
+                        (default: runelite; e.g. "flatpak run net.runelite.RuneLite")
   --character <name>    Launch this character by display name (skips the menu)
+  --picker <cmd>        Show the character menu with a dmenu-style command
+                        (names on stdin, choice on stdout), e.g. "fuzzel --dmenu"
+  --terminal <cmd>      When a login needs typing but there's no terminal (e.g.
+                        started from an app launcher), re-run inside this,
+                        e.g. "kitty -e"
 `
+
+// Set from flags; package-level because they only matter deep in the prompts.
+var (
+	pickerCmd   string
+	terminalCmd string
+)
 
 func main() {
 	args := os.Args[1:]
+
+	// Invoked by the desktop as the jagex: scheme handler: forward the URI to the
+	// osrs-login waiting at its login prompt, then exit.
+	if len(args) == 1 && strings.HasPrefix(args[0], "jagex:") {
+		if err := sendHandoff(args[0]); err != nil {
+			fatal(fmt.Errorf("no osrs-login is waiting for a login (%w)", err))
+		}
+		return
+	}
 	client := "runelite"
 	character := ""
 	cmd := ""
@@ -50,6 +75,16 @@ func main() {
 			i++
 			if i < len(args) {
 				client = args[i]
+			}
+		case "--picker", "--terminal":
+			flag := args[i]
+			i++
+			if i < len(args) {
+				if flag == "--picker" {
+					pickerCmd = args[i]
+				} else {
+					terminalCmd = args[i]
+				}
 			}
 		case "--character":
 			i++
@@ -87,11 +122,16 @@ func fatal(err error) {
 func run(forceLogin, forcePick bool, client, character string) error {
 	creds, _ := loadCreds()
 
-	// Fast path: reuse a stored game session — no browser, no OAuth.
+	// Fast path: reuse a stored game session — no browser, no OAuth. Only an
+	// actual rejection means "expired"; a network error shouldn't force a login.
 	if !forceLogin && creds.SessionID != "" {
-		if accounts, err := listAccounts(creds.SessionID); err == nil && len(accounts) > 0 {
+		accounts, err := listAccounts(creds.SessionID)
+		if err == nil && len(accounts) > 0 {
 			fmt.Fprintln(os.Stderr, "reusing saved game session")
 			return finishLaunch(client, character, forcePick, creds.SessionID, accounts, &creds)
+		}
+		if err != nil && !rejected(err) {
+			return fmt.Errorf("checking saved session: %w", err)
 		}
 	}
 
@@ -99,13 +139,19 @@ func run(forceLogin, forcePick bool, client, character string) error {
 	if err != nil {
 		return err
 	}
-	creds.RefreshToken = tokens.RefreshToken // refresh tokens rotate; keep the latest
+	// Refresh tokens rotate (the old one is now dead), so persist the new one
+	// immediately — before anything below can fail and lose it.
+	if tokens.RefreshToken != "" {
+		creds.RefreshToken = tokens.RefreshToken
+		persist(creds)
+	}
 
 	sessionID, err := obtainSession(tokens)
 	if err != nil {
 		return err
 	}
 	creds.SessionID = sessionID
+	persist(creds)
 
 	accounts, err := listAccounts(sessionID)
 	if err != nil {
@@ -147,6 +193,9 @@ func obtainSession(tokens Tokens) (string, error) {
 // login session cookie) and reads the game-scoped id_token from the
 // http://localhost URL the browser is redirected to.
 func browserConsent(idToken string) (string, error) {
+	if err := ensureTerminal(); err != nil {
+		return "", err
+	}
 	state, nonce := randomString(16), randomString(16)
 	u := consentURL(idToken, state, nonce)
 	fmt.Println("\nOne more step — authorizing your game session.")
@@ -156,8 +205,7 @@ func browserConsent(idToken string) (string, error) {
 	fmt.Println("\nYour browser will try to open a http://localhost page and fail to")
 	fmt.Println("connect — that is expected. Copy that http://localhost#... address from")
 	fmt.Print("the address bar and paste it here:\n> ")
-	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-	return tokenFromConsentRedirect(line, state, nonce)
+	return tokenFromConsentRedirect(readLine(), state, nonce)
 }
 
 // finishLaunch selects a character, persists state, and execs the client.
@@ -167,11 +215,16 @@ func finishLaunch(client, character string, forcePick bool, sessionID string, ac
 		return err
 	}
 	creds.AccountID = acc.AccountID
-	if err := saveCreds(*creds); err != nil {
-		fmt.Fprintln(os.Stderr, "warning: could not save session:", err)
-	}
+	persist(*creds)
 	fmt.Printf("Launching %s as %s...\n", client, acc.DisplayName)
 	return launch(client, sessionID, acc)
+}
+
+// persist saves creds, warning (not failing) if it can't.
+func persist(c Creds) {
+	if err := saveCreds(c); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: could not save session:", err)
+	}
 }
 
 // authenticate returns a token set, refreshing a saved session when possible
@@ -182,12 +235,18 @@ func authenticate(forceLogin bool, savedRefresh string) (Tokens, error) {
 		if err == nil {
 			return tokens, nil
 		}
+		if !rejected(err) {
+			return Tokens{}, fmt.Errorf("refreshing saved session: %w", err)
+		}
 		fmt.Fprintln(os.Stderr, "saved session expired or invalid — logging in again...")
 	}
 	return interactiveLogin()
 }
 
 func interactiveLogin() (Tokens, error) {
+	if err := ensureTerminal(); err != nil {
+		return Tokens{}, err
+	}
 	verifier, challenge := pkce()
 	state := randomString(16)
 	u := loginURL(challenge, state)
@@ -196,11 +255,12 @@ func interactiveLogin() (Tokens, error) {
 	openBrowser(u)
 	fmt.Println("\nIf it didn't open, paste this URL into your browser:")
 	fmt.Println("  " + u)
-	fmt.Println("\nAfter logging in you'll land on a runescape.com page. Copy its full")
-	fmt.Print("address from the browser and paste it here, then press Enter:\n> ")
+	fmt.Println("\nAfter logging in your browser hands the login back to osrs-login")
+	fmt.Println("automatically if the jagex: link handler is installed. Otherwise you'll")
+	fmt.Println("land on a runescape.com page: copy its full address from the browser and")
+	fmt.Print("paste it here, then press Enter:\n> ")
 
-	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-	code, err := parseAuthCode(line, state)
+	code, err := parseAuthCode(readLoginRedirect(), state)
 	if err != nil {
 		return Tokens{}, err
 	}
@@ -228,21 +288,83 @@ func chooseAccount(accounts []Account, wantName string, forcePick bool, creds *C
 			}
 		}
 	}
-	fmt.Println("Choose a character:")
+	names := make([]string, len(accounts))
 	for i, a := range accounts {
-		name := a.DisplayName
-		if name == "" {
-			name = "(unnamed)"
+		names[i] = a.DisplayName
+		if names[i] == "" {
+			names[i] = "(unnamed)"
 		}
+	}
+	if pickerCmd != "" {
+		i, err := runPicker(names)
+		if err != nil {
+			return Account{}, err
+		}
+		return accounts[i], nil
+	}
+	fmt.Println("Choose a character:")
+	for i, name := range names {
 		fmt.Printf("  [%d] %s\n", i+1, name)
 	}
 	fmt.Print("> ")
-	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-	n, err := strconv.Atoi(strings.TrimSpace(line))
+	n, err := strconv.Atoi(strings.TrimSpace(readLine()))
 	if err != nil || n < 1 || n > len(accounts) {
 		return Account{}, fmt.Errorf("invalid choice")
 	}
 	return accounts[n-1], nil
+}
+
+// runPicker shows names via the dmenu-style --picker command and returns the
+// index of the chosen one.
+func runPicker(names []string) (int, error) {
+	argv := strings.Fields(pickerCmd)
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Stdin = strings.NewReader(strings.Join(names, "\n") + "\n")
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("no character chosen (picker: %w)", err)
+	}
+	choice := strings.TrimSpace(string(out))
+	for i, n := range names {
+		if n == choice {
+			return i, nil
+		}
+	}
+	return 0, fmt.Errorf("picker returned unknown character %q", choice)
+}
+
+// isTerminal reports whether stdin is a terminal: TCGETS only succeeds on a tty
+// (a char-device check would also pass /dev/null).
+func isTerminal() bool {
+	var t syscall.Termios
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, os.Stdin.Fd(), syscall.TCGETS, uintptr(unsafe.Pointer(&t)))
+	return errno == 0
+}
+
+// ensureTerminal makes sure a typed-input prompt can be answered. With no
+// terminal on stdin it re-runs osrs-login, same arguments, inside --terminal.
+// Anything done so far (a rotated refresh token) is already saved, so the
+// re-run picks up where this one left off.
+func ensureTerminal() error {
+	if isTerminal() {
+		return nil
+	}
+	if terminalCmd == "" {
+		return fmt.Errorf("logging in needs a terminal: run osrs-login from one, or pass --terminal")
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	argv := append(strings.Fields(terminalCmd), self)
+	argv = append(argv, os.Args[1:]...)
+	path, err := exec.LookPath(argv[0])
+	if err != nil {
+		return fmt.Errorf("terminal %q not found on PATH: %w", argv[0], err)
+	}
+	argv[0] = path
+	return syscall.Exec(path, argv, os.Environ())
 }
 
 func accountNames(accounts []Account) string {
@@ -258,16 +380,102 @@ func openBrowser(u string) {
 }
 
 // launch sets the JX_* credentials in the environment and execs the client,
-// replacing this process (mirroring Bolt's launcher handoff).
+// replacing this process (mirroring Bolt's launcher handoff). client may carry
+// arguments, split on whitespace (no shell quoting).
 func launch(client, sessionID string, acc Account) error {
-	path, err := exec.LookPath(client)
-	if err != nil {
-		return fmt.Errorf("client %q not found on PATH: %w", client, err)
+	argv := strings.Fields(client)
+	if len(argv) == 0 {
+		return fmt.Errorf("empty --client")
 	}
+	path, err := exec.LookPath(argv[0])
+	if err != nil {
+		return fmt.Errorf("client %q not found on PATH: %w", argv[0], err)
+	}
+	argv[0] = path
 	env := append(os.Environ(),
 		"JX_SESSION_ID="+sessionID,
 		"JX_CHARACTER_ID="+acc.AccountID,
 		"JX_DISPLAY_NAME="+acc.DisplayName,
 	)
-	return syscall.Exec(path, []string{path}, env)
+	return syscall.Exec(path, argv, env)
+}
+
+// stdin is read by a single goroutine so a prompt can race it against the
+// jagex: handoff without losing input to a second buffered reader.
+var (
+	stdinOnce  sync.Once
+	stdinLines = make(chan string)
+)
+
+func stdinChan() <-chan string {
+	stdinOnce.Do(func() {
+		go func() {
+			r := bufio.NewReader(os.Stdin)
+			for {
+				line, err := r.ReadString('\n')
+				if line != "" {
+					stdinLines <- line
+				}
+				if err != nil {
+					close(stdinLines)
+					return
+				}
+			}
+		}()
+	})
+	return stdinLines
+}
+
+// readLine returns the next line of stdin ("" at EOF).
+func readLine() string { return <-stdinChan() }
+
+// handoffPath is the socket the login prompt listens on for the jagex: handler.
+func handoffPath() string {
+	dir := os.Getenv("XDG_RUNTIME_DIR")
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "osrs-login.sock")
+}
+
+// readLoginRedirect waits for the login redirect from whichever arrives first:
+// the jagex: scheme handler (via the socket) or a manual paste on stdin. The
+// state check in parseAuthCode guards against anything injected on the socket.
+func readLoginRedirect() string {
+	p := handoffPath()
+	_ = os.Remove(p) // stale socket from a crashed run
+	ln, err := net.Listen("unix", p)
+	if err != nil {
+		return readLine()
+	}
+	defer ln.Close() // also unlinks the socket
+
+	got := make(chan string, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		line, _ := bufio.NewReader(c).ReadString('\n')
+		got <- line
+	}()
+	select {
+	case line := <-got:
+		fmt.Println("(received login from browser)")
+		return line
+	case line := <-stdinChan():
+		return line
+	}
+}
+
+// sendHandoff forwards a jagex: URI to the waiting login prompt.
+func sendHandoff(uri string) error {
+	c, err := net.Dial("unix", handoffPath())
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	_, err = fmt.Fprintln(c, uri)
+	return err
 }

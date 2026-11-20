@@ -45,16 +45,35 @@ func loadCreds() (Creds, error) {
 }
 
 // saveCreds writes credentials with 0600 permissions (they grant account access).
+// It writes a temp file and renames it into place, so a crash mid-write can't
+// leave a truncated file and lose the (rotating) refresh token.
 func saveCreds(c Creds) error {
 	p, err := credsPath()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	data, _ := json.MarshalIndent(c, "", "  ")
-	return os.WriteFile(p, data, 0o600)
+	f, err := os.CreateTemp(dir, ".creds-*.json") // created 0600
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name()) // no-op once renamed
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), p)
 }
 
 // clearCreds removes the saved credentials, if any.
