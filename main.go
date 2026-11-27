@@ -1,4 +1,5 @@
-// Command osrs-login is a minimal, Bolt-free launcher for Old School RuneScape.
+// Command osrs-login is a minimal, Bolt-free launcher for Old School RuneScape
+// (and, with --game rs3, RuneScape 3).
 //
 // It performs the Jagex-account OAuth2 flow using your real web browser (no
 // embedded CEF, so none of Bolt's sandbox/render problems), then launches
@@ -34,6 +35,9 @@ Usage:
 Flags:
   --client <cmd>        Client command to launch, may include arguments
                         (default: runelite; e.g. "flatpak run net.runelite.RuneLite")
+  --game <osrs|rs3>     Which game to launch (default: osrs). rs3 defaults the client
+                        to /usr/share/games/runescape-launcher/runescape
+                        (from Jagex's Linux .deb)
   --character <name>    Launch this character by display name (skips the menu)
   --picker <cmd>        Show the character menu with a dmenu-style command
                         (names on stdin, choice on stdout), e.g. "fuzzel --dmenu"
@@ -46,7 +50,11 @@ Flags:
 var (
 	pickerCmd   string
 	terminalCmd string
+	rs3         bool
 )
+
+// rs3ConfigURI is what the RS3 client is pointed at; the same value Bolt passes.
+const rs3ConfigURI = "https://www.runescape.com/k=5/l=0/jav_config.ws"
 
 func main() {
 	args := os.Args[1:]
@@ -59,7 +67,8 @@ func main() {
 		}
 		return
 	}
-	client := "runelite"
+	client := ""
+	game := "osrs"
 	character := ""
 	cmd := ""
 
@@ -86,6 +95,11 @@ func main() {
 					terminalCmd = args[i]
 				}
 			}
+		case "--game":
+			i++
+			if i < len(args) {
+				game = args[i]
+			}
 		case "--character":
 			i++
 			if i < len(args) {
@@ -96,6 +110,19 @@ func main() {
 		default:
 			fmt.Fprintf(os.Stderr, "unknown argument: %s\n\n%s", args[i], usage)
 			os.Exit(2)
+		}
+	}
+
+	if game != "osrs" && game != "rs3" {
+		fatal(fmt.Errorf("unknown --game %q (want osrs or rs3)", game))
+	}
+	rs3 = game == "rs3"
+	if client == "" {
+		client = "runelite"
+		if rs3 {
+			// The real client, not the .deb's runescape-launcher script: that
+			// takes the config URI as a bare first argument, not --configURI.
+			client = "/usr/share/games/runescape-launcher/runescape"
 		}
 	}
 
@@ -397,6 +424,20 @@ func launch(client, sessionID string, acc Account) error {
 		"JX_CHARACTER_ID="+acc.AccountID,
 		"JX_DISPLAY_NAME="+acc.DisplayName,
 	)
+	if rs3 {
+		// The RS3 client needs its config URI, and (like Bolt) X11 for SDL so it
+		// runs under XWayland. Defaults only: the user's environment wins.
+		argv = append(argv, "--configURI", rs3ConfigURI)
+		for k, v := range map[string]string{
+			"SDL_VIDEODRIVER":       "x11",
+			"SDL_VIDEO_X11_WMCLASS": "RuneScape",
+			"PULSE_PROP_OVERRIDE":   "application.name='RuneScape' application.icon_name='runescape' media.role='game'",
+		} {
+			if os.Getenv(k) == "" {
+				env = append(env, k+"="+v)
+			}
+		}
+	}
 	return syscall.Exec(path, argv, env)
 }
 

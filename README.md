@@ -26,6 +26,7 @@ osrs-login --character Zezima      # launch a specific character (skips the menu
 osrs-login --client hdos           # launch a different client on PATH
 osrs-login --client "flatpak run net.runelite.RuneLite"   # client command with arguments
 osrs-login pick --picker "fuzzel --dmenu"                # character menu in fuzzel, not the terminal
+osrs-login --game rs3              # launch RuneScape 3 instead
 ```
 
 Plain `osrs-login` remembers the last character you picked and launches it
@@ -107,6 +108,23 @@ inputs.osrs-login.packages.${pkgs.system}.default
 Then `osrs-login` is on your `PATH`. Pair it with `runelite` (already in
 nixpkgs).
 
+### RuneScape 3
+
+`--game rs3` uses the same login, saved session and characters, but launches
+Jagex's native Linux RS3 client with the `--configURI` it needs and
+`SDL_VIDEODRIVER=x11`. The default client is
+`/usr/share/games/runescape-launcher/runescape`, the binary from the `.deb` at
+`content.runescape.com/downloads/ubuntu/`. Point `--client` at that binary
+(not the `runescape-launcher` wrapper script) if it lives elsewhere. osrs-login
+doesn't download or update the client for you.
+
+On NixOS the client needs an FHS environment plus end-of-life libraries that
+current nixpkgs has removed (OpenSSL 1.1, GTK 2). One way that works: take
+`openssl_1_1` and `gtk2-x11` from `nixos-24.05` (with
+`NIXPKGS_ALLOW_INSECURE=1`), plus `xorg.libSM` and `SDL2`, put their `lib` dirs
+on `LD_LIBRARY_PATH`, and run
+`osrs-login --game rs3 --client "steam-run /path/to/runescape"`.
+
 ## Credentials & security
 
 The cached refresh token grants access to your account. It's stored at
@@ -116,7 +134,7 @@ with `0600` permissions — the same plaintext model Bolt uses. Run
 
 ## Status
 
-v1: OSRS + RuneLite, single account. The login is validated end-to-end against
+OSRS + RuneLite, or RS3 via `--game rs3`, single account. The login is validated end-to-end against
 the live Jagex API.
 
 ## Acknowledgements & licensing

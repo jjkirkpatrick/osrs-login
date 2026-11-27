@@ -101,8 +101,11 @@ mode `0600`, the same trust model Bolt uses. `osrs-login logout` removes them.
 ## Scope
 
 **v1:** OSRS + RuneLite, single Jagex account, character remembered after first
-choice (re-choose with `pick`). **Non-goals (easy to add later):** RS3, HDOS, the
-official client, a GUI, multi-account quick-switching.
+choice (re-choose with `pick`). **RS3:** `--game rs3` reuses the same session and
+characters and execs the client with `--configURI
+https://www.runescape.com/k=5/l=0/jav_config.ws` plus X11/Pulse env defaults, as
+Bolt does. **Non-goals (easy to add later):** downloading the RS3 client, HDOS, the
+official OSRS client, a GUI, multi-account quick-switching.
 
 ## Packaging
 
